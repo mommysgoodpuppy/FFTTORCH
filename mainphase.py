@@ -14,8 +14,9 @@ def compute_fft_chunk(args):
     start_idx, end_idx, images = args
     ffts = []
     for img in images:
-        fft = torch.abs(torch.fft.rfft(img.view(-1))).numpy()
-        ffts.append(fft)
+        fft = torch.fft.rfft(img.view(-1))
+        fft_combined = torch.stack([fft.real, fft.imag], dim=0).numpy()
+        ffts.append(fft_combined)
     return start_idx, np.array(ffts, dtype=np.float32)
 
 class PrecomputedFFTDataset(Dataset):
@@ -29,15 +30,12 @@ class PrecomputedFFTDataset(Dataset):
         
         if os.path.exists(cache_file) and os.path.exists(labels_file):
             print("Loading pre-computed FFTs from cache...")
-            # Load directly into shared memory
             self.fft_cache = torch.load(cache_file)
             self.labels = torch.load(labels_file)
-            # Move to shared memory for efficient access
             self.fft_cache.share_memory_()
             self.labels.share_memory_()
         else:
             print("Pre-computing FFTs using multiple processes...")
-            # Prepare data in chunks for multiprocessing
             chunk_size = 1000
             chunks = []
             all_images = []
@@ -52,7 +50,6 @@ class PrecomputedFFTDataset(Dataset):
                 end = min(i + chunk_size, len(dataset))
                 chunks.append((i, end, all_images[i:end]))
             
-            # Process chunks in parallel
             with ProcessPoolExecutor() as executor:
                 results = list(tqdm(
                     executor.map(compute_fft_chunk, chunks),
@@ -60,17 +57,14 @@ class PrecomputedFFTDataset(Dataset):
                     desc="Computing FFTs"
                 ))
             
-            # Combine results directly into PyTorch tensors
             results.sort(key=lambda x: x[0])
             all_ffts = np.concatenate([r[1] for r in results])
             self.fft_cache = torch.from_numpy(all_ffts)
             self.labels = torch.tensor([label for label in all_labels], dtype=torch.long)
             
-            # Move to shared memory
             self.fft_cache.share_memory_()
             self.labels.share_memory_()
             
-            # Save as PyTorch tensors
             torch.save(self.fft_cache, cache_file)
             torch.save(self.labels, labels_file)
             print("FFT pre-computation complete and cached!")
@@ -79,7 +73,6 @@ class PrecomputedFFTDataset(Dataset):
         return len(self.dataset)
     
     def __getitem__(self, idx):
-        # No copy needed as we're using shared memory
         return self.fft_cache[idx], self.labels[idx]
 
 class FFTMLP(torch.nn.Module):
@@ -88,31 +81,32 @@ class FFTMLP(torch.nn.Module):
         self.freq_dim = input_dim // 2 + 1
         self.num_classes = output_dim
         
-        # Initialize filters in time domain with proper convolution structure
-        # Each filter represents a class's frequency response
-        filters = torch.zeros(output_dim, self.freq_dim, dtype=torch.cfloat)
+        filters_real = torch.zeros(output_dim, self.freq_dim)
+        filters_imag = torch.zeros(output_dim, self.freq_dim)
         for i in range(output_dim):
-            # Create filters with different frequency characteristics
             phase = 2 * math.pi * i / output_dim
             t = torch.arange(self.freq_dim, dtype=torch.float32)
-            filters[i] = torch.exp(1j * phase * t) * 0.02
+            complex_filter = torch.exp(1j * phase * t) * 0.02
+            filters_real[i] = complex_filter.real
+            filters_imag[i] = complex_filter.imag
         
-        # Make filters learnable
-        self.filters = torch.nn.Parameter(filters)
+        self.filters_real = torch.nn.Parameter(filters_real)
+        self.filters_imag = torch.nn.Parameter(filters_imag)
     
     def forward(self, x):
-        # Input is already in frequency domain from preprocessing
-        # Treat it as the FFT of our signal
-        x = torch.complex(x, torch.zeros_like(x))
+        # Split input into real and imaginary parts
+        x_real = x[:, 0]  # First channel is real
+        x_imag = x[:, 1]  # Second channel is imaginary
         
-        # Apply convolution theorem:
-        # conv(x, h) = ifft(fft(x) * fft(h))
-        # Since x is already fft'ed, we just need to multiply
-        y_freq = x.unsqueeze(1) * self.filters
+        # Complex multiplication with broadcasting
+        # x shape: [batch, freq_dim]
+        # filters shape: [num_classes, freq_dim]
+        # Result shape: [batch, num_classes, freq_dim]
+        y_real = (x_real.unsqueeze(1) * self.filters_real) - (x_imag.unsqueeze(1) * self.filters_imag)
+        y_imag = (x_real.unsqueeze(1) * self.filters_imag) + (x_imag.unsqueeze(1) * self.filters_real)
         
-        # Sum frequency components to get convolution result
-        # This is equivalent to taking the DC component of the inverse FFT
-        energies = y_freq.real.sum(dim=-1)
+        # Sum along frequency dimension
+        energies = y_real.sum(dim=-1) + y_imag.sum(dim=-1)
         
         return energies
 
@@ -121,11 +115,8 @@ def train_model(model, train_loader, test_loader, epochs=10, device="cpu"):
     model = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
     
-    # We can still use cross entropy since we're returning logits
-    # (negative distances work like logits)
     criterion = torch.nn.CrossEntropyLoss()
     
-    # Maximize CPU parallelization
     torch.set_num_threads(torch.get_num_threads())
     torch.set_float32_matmul_precision('medium')
     
@@ -160,25 +151,28 @@ def train_model(model, train_loader, test_loader, epochs=10, device="cpu"):
 
 def main():
     input_dim = 28 * 28
-    hidden_dim = 512  # Not used anymore
+    hidden_dim = 512  
     output_dim = 10
     batch_size = 256
-    epochs = 64
+    epochs = 3
 
     transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize((0.1307,), (0.3081,))
     ])
     
-    # Load original datasets
+    # Clear cache directory
+    import shutil
+    cache_dir = 'fft_cache'
+    if os.path.exists(cache_dir):
+        shutil.rmtree(cache_dir)
+    
     train_dataset = datasets.MNIST('data', train=True, download=True, transform=transform)
     test_dataset = datasets.MNIST('data', train=False, transform=transform)
     
-    # Wrap datasets with FFT pre-computation
     train_dataset = PrecomputedFFTDataset(train_dataset)
     test_dataset = PrecomputedFFTDataset(test_dataset)
     
-    # Maximize data loading parallelization
     num_workers = min(8, torch.get_num_threads())
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
                             num_workers=num_workers, pin_memory=True,
